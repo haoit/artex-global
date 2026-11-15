@@ -51,6 +51,11 @@ type taskLLMRuntime struct {
 	s        *Server
 	taskID   string
 	agentKey string
+	// reasoningOff makes current() resolve a reasoning-disabled variant of the task's
+	// provider and skip agent bindings. Set only for the §4 compaction runtime (see
+	// agentsForTask): disabling reasoning is what keeps large blocks from coming back
+	// with an empty body on endpoints that ignore thinking:disabled.
+	reasoningOff bool
 }
 
 type taskLLMError struct {
@@ -122,23 +127,46 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 	r.s.syncTaskLLMState(pt)
 	t, _ := r.s.m.Task(r.taskID)
 	sel := taskLLMSelection{task: t, revision: pt.LLMChainRevision}
-	if prov, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
-		sel.provider, sel.retry = prov, cfg.Retry
-		return sel, nil
+	// The compaction runtime (reasoningOff) always resolves the task's active chain
+	// profile with reasoning disabled; it skips agent bindings so a bound, reasoning-on
+	// provider can never reintroduce the empty-body loop (§4).
+	if !r.reasoningOff {
+		if prov, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
+			sel.provider, sel.retry = prov, cfg.Retry
+			return sel, nil
+		}
 	}
 	if len(pt.LLMProfileIDs) > 0 {
 		if pt.ActiveLLMProfileID == nil {
 			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
-		prov, cfg, ok := r.s.providerForProfile(sel.profileID)
+		var (
+			prov llm.Provider
+			cfg  agent.Config
+			ok   bool
+		)
+		if r.reasoningOff {
+			prov, cfg, ok = r.s.providerForProfileNoReason(sel.profileID)
+		} else {
+			prov, cfg, ok = r.s.providerForProfile(sel.profileID)
+		}
 		if !ok {
 			return sel, fmt.Errorf("LLM profile #%d is missing or invalid", sel.profileID)
 		}
 		sel.provider, sel.retry = prov, cfg.Retry
 		return sel, nil
 	}
-	prov, cfg, ok := r.s.globalProvider()
+	var (
+		prov llm.Provider
+		cfg  agent.Config
+		ok   bool
+	)
+	if r.reasoningOff {
+		prov, cfg, ok = r.s.globalProviderNoReason()
+	} else {
+		prov, cfg, ok = r.s.globalProvider()
+	}
 	if !ok {
 		return sel, fmt.Errorf("task %s has no available fallback LLM provider", r.taskID)
 	}
@@ -515,6 +543,20 @@ func (s *Server) globalProvider() (llm.Provider, agent.Config, bool) {
 	return s.llmProv, s.llmCfg, true
 }
 
+// globalProviderNoReason mirrors globalProvider but with reasoning disabled, for the
+// §4 compaction call on a task that has no explicit chain (so compaction falls through
+// to the global provider).
+func (s *Server) globalProviderNoReason() (llm.Provider, agent.Config, bool) {
+	s.cfgMu.Lock()
+	on := s.llmOn && s.llmProv != nil
+	cfg := s.llmCfg
+	s.cfgMu.Unlock()
+	if !on {
+		return nil, agent.Config{}, false
+	}
+	return s.buildNoReasonProvider(0, cfg, "global")
+}
+
 // taskRuntimeAvailable reports whether every listed role can resolve a provider
 // under the runtime precedence in current(): the role's own binding first, then
 // the task chain, then global. An exhausted chain is a hard stop for unbound
@@ -585,7 +627,12 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
 	// (agentsForTask),Compactor 必须接在这里。走任务路由的 planner provider(§4:与 agent
 	// 同模型,随任务 LLM 链解析),压缩用 Complete 一次性生成 body。
-	pl.SetCompactor(agent.NewCompactor(plannerRuntime, "task-router"))
+	// Compaction (§4) runs reasoning-disabled on a dedicated runtime: this endpoint
+	// family ignores the request's thinking:disabled and otherwise burns the whole
+	// output budget on reasoning, returning an empty body for large blocks (the
+	// cold-compaction loop). The agent/planner keep reasoning on via plannerRuntime.
+	compactionRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "planner", reasoningOff: true}
+	pl.SetCompactor(agent.NewCompactor(compactionRuntime, "task-router"))
 	main := agent.NewMainAgent(mainRuntime, "task-router", s.m.dir, tx, mainRuntime.CompactionWindow(), s.agentMaxTurns("mainagent"))
 	main.SetFindingRecorder(s.evidenceStore())
 	main.SetCompactionWindowResolver(mainRuntime.CompactionWindow)

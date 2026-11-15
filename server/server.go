@@ -181,7 +181,13 @@ type Server struct {
 	// configured request rate. Cleared on profile edits, then repopulated by active reapply.
 	provCacheMu   sync.Mutex
 	provByProfile map[int64]*provEntry
-	provCacheGen  uint64
+	// provByProfileNoReason caches reasoning-disabled variants of the same providers,
+	// keyed by profile id (0 = global). Used only by the §4 compaction runtime: this
+	// endpoint family ignores a request's thinking:disabled and otherwise spends the
+	// whole output budget on reasoning, returning an empty body for large blocks.
+	// Cleared together with provByProfile on profile edits.
+	provByProfileNoReason map[int64]*provEntry
+	provCacheGen          uint64
 
 	// llmHealth is the process-wide circuit-breaker state for LLM failover (轮询).
 	// It deliberately lives OUTSIDE the provider caches: rebuilding the chain
@@ -234,7 +240,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
-		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
+		provByProfile:  map[int64]*provEntry{}, provByProfileNoReason: map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	// First-run protection: cache the password hash and, while none is set, issue
 	// the console setup token (or apply ARTEX_ADMIN_PASSWORD) before any request.
@@ -706,6 +712,58 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 	return prov, cfg, true
 }
 
+// buildNoReasonProvider builds (and caches, keyed by id; 0 = global) a provider
+// identical to what id/cfg would produce but with reasoning disabled
+// (ReasoningEffort="none"). It serves the §4 compaction call: this endpoint family
+// ignores a request's thinking:disabled and keeps spending the whole output budget on
+// reasoning, so large blocks come back with an empty body and the cold-compaction loop
+// never clears. Mirrors providerForProfile's build/wrap/cache, including the generation
+// race guard so a concurrent profile edit is not papered over.
+func (s *Server) buildNoReasonProvider(id int64, cfg agent.Config, name string) (llm.Provider, agent.Config, bool) {
+	s.provCacheMu.Lock()
+	if e := s.provByProfileNoReason[id]; e != nil {
+		s.provCacheMu.Unlock()
+		return e.prov, e.cfg, true
+	}
+	generation := s.provCacheGen
+	s.provCacheMu.Unlock()
+	cfg.ReasoningEffort = "none"
+	prov, err := cfg.NewProvider()
+	if err != nil {
+		log.Printf("[engine] build no-reasoning provider for LLM profile %d failed: %v", id, err)
+		return nil, agent.Config{}, false
+	}
+	prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, name, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
+	prov = bindSideProvider(prov, cfg, id, name)
+	s.provCacheMu.Lock()
+	if generation != s.provCacheGen {
+		s.provCacheMu.Unlock()
+		return s.buildNoReasonProvider(id, cfg, name)
+	}
+	if e := s.provByProfileNoReason[id]; e != nil { // lost the race → keep the winner
+		prov, cfg = e.prov, e.cfg
+	} else {
+		s.provByProfileNoReason[id] = &provEntry{prov: prov, cfg: cfg}
+		log.Printf("[engine] built no-reasoning provider for LLM profile %d (%s / %s)", id, cfg.Provider(), cfg.Model)
+	}
+	s.provCacheMu.Unlock()
+	return prov, cfg, true
+}
+
+// providerForProfileNoReason mirrors providerForProfile but disables reasoning (see
+// buildNoReasonProvider). Used only by the compaction runtime.
+func (s *Server) providerForProfileNoReason(id int64) (llm.Provider, agent.Config, bool) {
+	cfg, ok := s.loadProfileConfig(id)
+	if !ok {
+		return nil, agent.Config{}, false
+	}
+	name := ""
+	if p, _ := s.m.pg.ProfileByID(id); p != nil {
+		name = p.Name
+	}
+	return s.buildNoReasonProvider(id, cfg, name)
+}
+
 // chatAgentForProfile returns a ChatAgent built from a specific LLM profile, cached
 // per profile id. Returns nil if the profile is missing or has no API key.
 func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
@@ -747,6 +805,7 @@ func (s *Server) invalidateProfileAgents() {
 	s.provCacheMu.Lock()
 	s.provCacheGen++
 	s.provByProfile = map[int64]*provEntry{}
+	s.provByProfileNoReason = map[int64]*provEntry{}
 	s.provCacheMu.Unlock()
 	s.invalidateTaskAgents()
 }
