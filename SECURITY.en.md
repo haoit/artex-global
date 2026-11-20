@@ -44,6 +44,6 @@ The following are **not** covered by this security policy.
 
 ## Reporting misuse
 
-If you believe ARTEX was used against your systems without authorization, email **travelandi01@gmail.com**. Send any technical indicators you have (IP addresses, timestamps, request logs and other indicators of compromise); we will review them and cooperate with investigators where they can help. Please do not report misuse in a public issue.
+If you believe ARTEX was used against your systems without authorization, email **honghao96@gmail.com**. Send any technical indicators you have (IP addresses, timestamps, request logs and other indicators of compromise); we will review them and cooperate with investigators where they can help. Please do not report misuse in a public issue.
 
 The maintainers cannot stop or trace ARTEX instances that other people run. If you have suffered real harm, please also report it to the relevant authorities (in the US, the FBI at ic3.gov; elsewhere, your national law enforcement or CERT).
